@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>F1 Daytona Online</title>
+    <script src="https://cdn.ably.com/lib/ably.min-1.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; background: #000; color: white; }
+        #overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.9); display: flex; justify-content: center; align-items: center; z-index: 100; }
+        .card { background: #111; padding: 30px; border: 2px solid #ff0044; border-radius: 10px; text-align: center; width: 300px; }
+        input { width: 90%; padding: 10px; margin: 10px 0; background: #222; color: #fff; border: 1px solid #444; }
+        button { background: #ff0044; color: #fff; border: none; padding: 12px; width: 100%; cursor: pointer; font-weight: bold; margin-top: 10px; border-radius: 5px; }
+        #lobby-list { text-align: left; margin: 15px 0; color: #00ffcc; font-size: 14px; background: #000; padding: 10px; }
+        #hud { position: absolute; top: 10px; left: 10px; color: #ff0044; font-size: 30px; font-weight: bold; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+<div id="hud"><span id="spd">0</span> MPH</div>
+
+<div id="overlay">
+    <div class="card" id="ui-box">
+        <h1>F1 ONLINE</h1>
+        <div id="login-step">
+            <input type="text" id="username" placeholder="Your Name">
+            <button onclick="startApp()">JOIN RACE</button>
+        </div>
+        <div id="lobby-step" style="display:none">
+            <div id="lobby-list">Connecting...</div>
+            <button id="start-btn" onclick="triggerStart()">START ENGINES</button>
+        </div>
+    </div>
+</div>
+
+<script>
+// I put the key in here for you. No need to change it!
+const KEY = '2EWZCQ.oXMC_Q:N16koIaIp90IV9tarUUfvmY8XJIel_cao1o0YLs4mBs';
+let ably, channel, myName, players = {}, active = false;
+
+async function startApp() {
+    myName = document.getElementById('username').value || "Driver" + Math.floor(Math.random()*99);
+    document.getElementById('login-step').style.display = 'none';
+    document.getElementById('lobby-step').style.display = 'block';
+
+    ably = new Ably.Realtime(KEY);
+    channel = ably.channels.get('global-daytona');
+
+    channel.presence.subscribe(['enter', 'leave', 'present'], () => {
+        channel.presence.get((err, members) => {
+            document.getElementById('lobby-list').innerHTML = members.map(m => `🏎️ ${m.data.name}`).join('<br>');
+        });
+    });
+
+    channel.subscribe('go', () => { document.getElementById('overlay').style.display = 'none'; active = true; });
+    channel.subscribe('move', (m) => { if(m.clientId !== ably.auth.clientId) updateOther(m.clientId, m.data); });
+
+    await channel.presence.enter({ name: myName });
+    init3D();
+}
+
+function triggerStart() { channel.publish('go', {}); }
+
+// --- GAME ENGINE ---
+let scene, camera, renderer, world, carBody, carMesh, keys = {};
+
+function init3D() {
+    scene = new THREE.Scene(); scene.background = new THREE.Color(0x87ceeb);
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 2000);
+    renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+
+    world = new CANNON.World(); world.gravity.set(0, -9.8, 0);
+
+    const track = new THREE.Mesh(new THREE.RingGeometry(380, 460, 64), new THREE.MeshStandardMaterial({color: 0x222222}));
+    track.rotation.x = -Math.PI/2; scene.add(track);
+
+    carBody = new CANNON.Body({ mass: 1000, shape: new CANNON.Box(new CANNON.Vec3(2, 1, 4.5)) });
+    carBody.position.set(420, 2, 0); world.addBody(carBody);
+    carMesh = new THREE.Mesh(new THREE.BoxGeometry(4, 2, 9), new THREE.MeshStandardMaterial({color: 0xff0044}));
+    scene.add(carMesh);
+
+    window.onkeydown = (e) => keys[e.key.toLowerCase()] = true;
+    window.onkeyup = (e) => keys[e.key.toLowerCase()] = false;
+    animate();
+}
+
+function updateOther(id, d) {
+    if(!players[id]) {
+        players[id] = new THREE.Mesh(new THREE.BoxGeometry(4, 2, 9), new THREE.MeshStandardMaterial({color: 0x00ffcc}));
+        scene.add(players[id]);
+    }
+    players[id].position.set(d.x, d.y, d.z);
+    players[id].quaternion.set(d.qx, d.qy, d.qz, d.qw);
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    world.step(1/60);
+    if(active) {
+        if(keys['w']) {
+            let f = new CANNON.Vec3(0,0,65000); carBody.quaternion.vmult(f,f);
+            carBody.applyForce(f, carBody.position);
+        }
+        if(keys['a']) carBody.angularVelocity.y = 1.6;
+        if(keys['d']) carBody.angularVelocity.y = -1.6;
+        if(carBody.velocity.length() > 80) carBody.velocity.scale(80/carBody.velocity.length(), carBody.velocity);
+        channel.publish('move', {
+            x: carBody.position.x, y: carBody.position.y, z: carBody.position.z,
+            qx: carBody.quaternion.x, qy: carBody.quaternion.y, qz: carBody.quaternion.z, qw: carBody.quaternion.w
+        });
+    }
+    carMesh.position.copy(carBody.position); carMesh.quaternion.copy(carBody.quaternion);
+    document.getElementById('spd').innerText = Math.round(carBody.velocity.length() * 2.23);
+    let camP = new THREE.Vector3(0, 12, -28).applyQuaternion(carMesh.quaternion);
+    camera.position.lerp(carMesh.position.clone().add(camP), 0.1);
+    camera.lookAt(carMesh.position);
+    renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
