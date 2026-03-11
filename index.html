@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>F1 Daytona Online</title>
+    <script src="https://cdn.ably.com/lib/ably.min-1.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #000; color: white; }
+        #overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.9); display: flex; justify-content: center; align-items: center; z-index: 100; }
+        .menu { background: #111; padding: 40px; border: 2px solid #ff0044; border-radius: 15px; text-align: center; width: 320px; box-shadow: 0 0 30px rgba(255,0,68,0.4); }
+        input { width: 90%; padding: 12px; margin: 10px 0; border-radius: 5px; border: 1px solid #444; background: #222; color: white; font-size: 16px; outline: none; }
+        input:focus { border-color: #ff0044; }
+        button { background: #ff0044; color: white; border: none; padding: 15px; width: 100%; cursor: pointer; font-weight: bold; font-size: 18px; border-radius: 5px; margin-top: 10px; transition: 0.2s; }
+        button:hover { background: #ff3366; transform: scale(1.02); }
+        button:disabled { background: #333; cursor: not-allowed; transform: none; }
+        #lobby-status { margin: 20px 0; text-align: left; background: #000; padding: 10px; border-radius: 5px; color: #00ffcc; font-family: 'Courier New', monospace; min-height: 60px; border: 1px solid #222; }
+        #hud { position: absolute; top: 20px; left: 20px; z-index: 10; pointer-events: none; }
+        .speed { font-size: 48px; color: #ff0044; font-weight: 900; font-style: italic; text-shadow: 2px 2px #000; }
+        #status-text { font-size: 12px; color: #888; margin-top: 5px; }
+    </style>
+</head>
+<body>
+
+    <div id="hud">
+        <div class="speed"><span id="spd-val">0</span> <small style="font-size:20px">MPH</small></div>
+    </div>
+
+    <div id="overlay">
+        <div class="menu">
+            <h1>F1 <span style="color:#ff0044">DAYTONA</span></h1>
+            
+            <div id="setup-step">
+                <input type="text" id="username" placeholder="Driver Name">
+                <button id="join-btn" onclick="connectToAbly()">JOIN RACE</button>
+                <div id="status-text">Enter name to connect to server</div>
+            </div>
+
+            <div id="lobby-step" style="display:none">
+                <div id="lobby-status">Synchronizing players...</div>
+                <button id="start-btn" onclick="requestStart()">START ENGINES</button>
+                <p style="font-size:11px; color:#666; margin-top:15px;">Shared Global Lobby: One race for everyone!</p>
+            </div>
+        </div>
+    </div>
+
+<script>
+/** 1. MULTIPLAYER ENGINE **/
+const ABLY_KEY = '2EWZCQ.oXMC_Q:N16koIaIp90IV9tarUUfvmY8XJIel_cao1o0YLs4mBs'; 
+let ably, channel, myName, players = {}, raceActive = false;
+
+async function connectToAbly() {
+    const nameInput = document.getElementById('username');
+    if(!nameInput.value) return alert("Please enter a driver name!");
+    
+    myName = nameInput.value;
+    const joinBtn = document.getElementById('join-btn');
+    const statusText = document.getElementById('status-text');
+
+    joinBtn.disabled = true;
+    statusText.innerText = "Connecting to Ably Realtime...";
+
+    try {
+        ably = new Ably.Realtime(ABLY_KEY);
+        await ably.connection.once('connected');
+        
+        // Using a unique channel name for this specific key
+        channel = ably.channels.get('daytona-f1-main');
+
+        document.getElementById('setup-step').style.display = 'none';
+        document.getElementById('lobby-step').style.display = 'block';
+
+        // Subscriptions
+        channel.presence.subscribe(['enter', 'leave', 'present', 'update'], updateLobbyUI);
+        channel.subscribe('race-start', () => {
+            document.getElementById('overlay').style.display = 'none';
+            raceActive = true;
+        });
+        channel.subscribe('move', (m) => {
+            if(m.clientId !== ably.auth.clientId) updateRemoteCar(m.clientId, m.data);
+        });
+
+        await channel.presence.enter({ name: myName });
+        initGame();
+        updateLobbyUI();
+    } catch (e) {
+        alert("Connection failed! Check your API key or internet.");
+        joinBtn.disabled = false;
+        statusText.innerText = "Error: " + e.message;
+    }
+}
+
+function updateLobbyUI() {
+    channel.presence.get((err, members) => {
+        if(err) return;
+        const status = document.getElementById('lobby-status');
+        status.innerHTML = members.map((m, i) => {
+            const isMe = m.clientId === ably.auth.clientId;
+            return `<div>${i===0?'👑':'🏎️'} ${m.data.name} ${isMe ? '(You)' : ''}</div>`;
+        }).join('');
+    });
+}
+
+function requestStart() {
+    channel.publish('race-start', { sender: myName });
+}
+
+/** 2. 3D PHYSICS & GRAPHICS **/
+let scene, camera, renderer, world, carBody, carMesh, keys = {};
+
+function initGame() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 3000);
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+    sun.position.set(50, 100, 50);
+    scene.add(sun);
+
+    world = new CANNON.World();
+    world.gravity.set(0, -9.8, 0);
+
+    // Track Geometry
+    const track = new THREE.Mesh(new THREE.RingGeometry(380, 460, 64), new THREE.MeshStandardMaterial({color: 0x222222}));
+    track.rotation.x = -Math.PI/2;
+    scene.add(track);
+
+    // Physics Car
+    carBody = new CANNON.Body({ mass: 1000, shape: new CANNON.Box(new CANNON.Vec3(2, 1, 4.5)) });
+    carBody.position.set(420, 2, 0);
+    world.addBody(carBody);
+    
+    // Visual Car
+    carMesh = new THREE.Mesh(new THREE.BoxGeometry(4, 2, 9), new THREE.MeshStandardMaterial({color: 0xff0044}));
+    scene.add(carMesh);
+
+    window.onkeydown = (e) => keys[e.key.toLowerCase()] = true;
+    window.onkeyup = (e) => keys[e.key.toLowerCase()] = false;
+    
+    animate();
+}
+
+function updateRemoteCar(id, d) {
+    if(!players[id]) {
+        players[id] = new THREE.Mesh(new THREE.BoxGeometry(4, 2, 9), new THREE.MeshStandardMaterial({color: 0x00ffcc}));
+        scene.add(players[id]);
+    }
+    players[id].position.set(d.x, d.y, d.z);
+    players[id].quaternion.set(d.qx, d.qy, d.qz, d.qw);
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    world.step(1/60);
+
+    if(raceActive) {
+        if(keys['w']) {
+            let force = new CANNON.Vec3(0,0,68000); 
+            carBody.quaternion.vmult(force, force);
+            carBody.applyForce(force, carBody.position);
+        }
+        if(keys['a']) carBody.angularVelocity.y = 1.7;
+        if(keys['d']) carBody.angularVelocity.y = -1.7;
+        
+        // Speed Limiter (~180 MPH)
+        let velocity = carBody.velocity.length();
+        if(velocity > 80) carBody.velocity.scale(80/velocity, carBody.velocity);
+
+        // Broadcast Position
+        channel.publish('move', {
+            x: carBody.position.x, y: carBody.position.y, z: carBody.position.z,
+            qx: carBody.quaternion.x, qy: carBody.quaternion.y, qz: carBody.quaternion.z, qw: carBody.quaternion.w
+        });
+    }
+
+    // Sync Visuals
+    carMesh.position.copy(carBody.position);
+    carMesh.quaternion.copy(carBody.quaternion);
+    document.getElementById('spd-val').innerText = Math.round(carBody.velocity.length() * 2.237);
+
+    // Camera follow
+    let offset = new THREE.Vector3(0, 12, -28).applyQuaternion(carMesh.quaternion);
+    camera.position.lerp(carMesh.position.clone().add(offset), 0.1);
+    camera.lookAt(carMesh.position);
+    
+    renderer.render(scene, camera);
+}
+
+// Handle Window Resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
